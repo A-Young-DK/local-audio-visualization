@@ -57,27 +57,52 @@ class DemoSource:
 
 
 class LoopbackSource:
-    def __init__(self, device):
+    """Captures an input device, always returning exactly `block` samples.
+
+    PortAudio backends (notably JACK, which PipeWire uses) may deliver small
+    callbacks (e.g. 512 frames), so chunks are accumulated until a full block
+    is available. read() never blocks forever: if the stream stalls it returns
+    silence so the visualizer keeps rendering.
+    """
+
+    def __init__(self, device, block):
         import sounddevice as sd
 
-        self.q = queue.Queue(maxsize=8)
-        self.stream = sd.InputStream(
-            device=device,
-            channels=1,
-            dtype="float32",
-            callback=self._cb,
-        )
+        self.block = block
+        self.buf = np.zeros(0, dtype=np.float64)
+        self.cv = threading.Condition()
+        try:
+            self.stream = sd.InputStream(
+                device=device,
+                channels=1,
+                dtype="float32",
+                callback=self._cb,
+            )
+        except Exception as e:
+            raise SystemExit(
+                f"Could not open input device {device!r}: {e}\n"
+                "Run with --list-devices to see available devices."
+            )
         self.stream.start()
 
     def _cb(self, indata, frames, time_info, status):
-        mono = indata[:, 0]
-        try:
-            self.q.put_nowait(mono.astype(np.float64))
-        except queue.Full:
-            pass
+        with self.cv:
+            self.buf = np.concatenate((self.buf, indata[:, 0].astype(np.float64)))
+            if self.buf.size > 16 * self.block:
+                self.buf = self.buf[-8 * self.block:]
+            self.cv.notify_all()
 
     def read(self):
-        return self.q.get()
+        deadline = time.monotonic() + 1.0
+        with self.cv:
+            while self.buf.size < self.block:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return np.zeros(self.block)
+                self.cv.wait(remaining)
+            out = self.buf[: self.block]
+            self.buf = self.buf[self.block:]
+            return out
 
 
 WINDOW = np.hanning(FFT_SIZE)
@@ -99,6 +124,7 @@ def producer(src, stop):
     peak = 1e-6
     energy_hist = deque(maxlen=45)
     last_beat = 0.0
+    n_frames = 0
     while not stop.is_set():
         block = src.read()
         if block is None or len(block) < FFT_SIZE:
@@ -122,6 +148,10 @@ def producer(src, stop):
             "energy": round(energy, 4),
         }
         broadcast(frame)
+        n_frames += 1
+        if n_frames % (FPS * 2) == 0:
+            rms = float(np.sqrt(np.mean(np.square(block))))
+            print(f"level: rms={rms:.4f} energy={energy:.4f}", flush=True)
         time.sleep(1.0 / FPS)
 
 
@@ -197,17 +227,61 @@ def list_devices():
         )
 
 
+def default_sink_description():
+    """Description of the system default sink, e.g. 'SteelSeries'."""
+    import subprocess
+
+    try:
+        sink = subprocess.check_output(["pactl", "get-default-sink"], text=True).strip()
+        out = subprocess.check_output(["pactl", "list", "sinks"], text=True)
+    except Exception:
+        return None
+    for chunk in out.split("Sink #")[1:]:
+        name = desc = None
+        for line in chunk.splitlines():
+            s = line.strip()
+            if s.startswith("Name:"):
+                name = s.split(":", 1)[1].strip()
+            elif s.startswith("Description:"):
+                desc = s.split(":", 1)[1].strip()
+        if name == sink and desc:
+            return desc
+    return None
+
+
 def resolve_device(spec):
     import sounddevice as sd
 
-    if spec is None:
+    devices = list(enumerate(sd.query_devices()))
+    if spec is None or spec.lower() == "monitor":
+        # On PulseAudio/PipeWire the monitor of the default sink carries
+        # everything played to the speakers. sounddevice exposes it under the
+        # sink's description (e.g. the JACK node 'SteelSeries').
+        desc = default_sink_description()
+        if desc:
+            for i, d in devices:
+                if d["name"].strip().lower() == desc.lower() and d["max_input_channels"] > 0:
+                    return i
+            for i, d in devices:
+                if desc.lower() in d["name"].lower() and d["max_input_channels"] > 0:
+                    return i
+        if spec is not None:
+            raise SystemExit("Could not resolve the default sink's monitor via pactl.")
         return None
     if spec.isdigit():
         return int(spec)
-    for i, d in enumerate(sd.query_devices()):
-        if spec.lower() in d["name"].lower() and d["max_input_channels"] > 0:
-            return i
-    raise SystemExit(f"No input device matching {spec!r}. Run with --list-devices.")
+    matches = [
+        (i, d) for i, d in devices
+        if spec.lower() in d["name"].lower() and d["max_input_channels"] > 0
+    ]
+    if not matches:
+        raise SystemExit(f"No input device matching {spec!r}. Run with --list-devices.")
+    if len(matches) > 1:
+        print(f"Multiple input devices match {spec!r}:")
+        for i, d in matches:
+            print(f"  {i}: {d['name']}  inputs={d['max_input_channels']}")
+        print(f"Using {matches[0][0]}; pass an index to pick another.")
+    return matches[0][0]
 
 
 def main():
@@ -217,7 +291,8 @@ def main():
     ap.add_argument("--demo", action="store_true",
                     help="synthesize audio instead of capturing (no device needed)")
     ap.add_argument("--device", default=None,
-                    help="input device index or name substring (cable / stereo mix / monitor)")
+                    help="input device index or name substring; 'monitor' (the default) "
+                         "captures the monitor of the system default sink")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
@@ -232,8 +307,13 @@ def main():
         print("Demo mode: synthesized audio")
     else:
         dev = resolve_device(args.device)
-        src = LoopbackSource(dev)
-        print(f"Capturing input device: {dev}")
+        src = LoopbackSource(dev, BLOCK)
+        if dev is None:
+            print("Capturing input device: system default input", flush=True)
+        else:
+            import sounddevice as sd
+
+            print(f"Capturing input device: {dev} ({sd.query_devices(dev)['name']})", flush=True)
 
     stop = threading.Event()
     threading.Thread(target=producer, args=(src, stop), daemon=True).start()
