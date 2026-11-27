@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pandora Visualizer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; cursor: pointer; }
+  #hint {
+    position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+    color: #fff; opacity: .55; font: 13px/1.4 system-ui, sans-serif;
+    letter-spacing: .08em; pointer-events: none; white-space: nowrap;
+    animation: fadeout 1.2s ease 5s forwards;
+  }
+  @keyframes fadeout { to { opacity: 0; } }
+</style>
+</head>
+<body>
+<canvas id="viz"></canvas>
+<div id="hint">click for fullscreen &middot; patterns &amp; colors randomize on their own</div>
+<script src="/visualizer.js"></script>
+</body>
+</html>
